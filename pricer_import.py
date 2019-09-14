@@ -10,29 +10,52 @@ import psycopg2
 #from openpyxl import load_workbook
 #from openpyxl.utils.dataframe import dataframe_to_rows
 
+def insert_row(conn, table, values, columns=None, id_col=None):
+    if columns==None:
+        sql = "INSERT INTO %s VALUES(%s);" % (table, str(values.tolist())[1:-1])
+    elif id_col is None:
+        sql = "INSERT INTO %s(%s) VALUES(%s);" % (table,
+                str(columns)[1:-1].replace("\'", ""), str(values)[1:-1])
+    else:
+        sql = "INSERT INTO %s(%s) VALUES(%s) RETURNING %s;" % (table,
+                str(columns)[1:-1].replace("\'", ""), str(values)[1:-1], id_col)
+    cur = conn.cursor()
+    try:
+        cur.execute(sql)
+        idx = cur.fetchone()[0]
+    except Exception as error:
+        idx = error
+    conn.commit()
+    return(idx)
+
+def stash_file(conn, file_type_id, file, storage_name):
+    storage_path = "/Users/john/code/cost_control/storage/"
+    idx = insert_row(conn, 'info.files', [file_type_id, storage_path + storage_name],
+            columns=['file_type_id', 'path'], id_col='file_id')
+    os.system("cp %s %s" % (file, storage_path + storage_name))
+    return(idx)
+
 class Budget:
     def __init__(self, budget_file):
         self.budget_file=budget_file
         self.pricer=None
-        self.task_info=None
-        self.sub_info=None
-        self.labor_info=None
-        self.travel_info=None
-        self.expenses_info=None
-
+        self.conn = psycopg2.connect(user='airsci', host='localhost', port='5432',
+                database='cost_control')
 
     def parse_task_info(self):
         task_text = self.pricer.parse(sheet_name="Task Order Setup", header=None, usecols="C",
                 nrows=3)
-        task_info = {'agree_no':re.findall('\d{5}[A-Z]', task_text.iloc[1, 0]),
-            'proj_no':re.findall('\d{3}$', task_text.iloc[1, 0]),
+        start_date = dt.datetime.strptime(re.findall('\d{2}/\d{2}/\d{2}', task_text.iloc[2, 0])[0],
+                '%m/%d/%y')
+        end_date = dt.datetime.strptime(re.findall('\d{2}/\d{2}/\d{2}', task_text.iloc[2, 0])[1],
+                '%m/%d/%y')
+        task_info = {'agree_no':re.findall('\d{5}[A-Z]', task_text.iloc[1, 0])[0],
+            'proj_no':re.findall('\d{3}$', task_text.iloc[1, 0])[0],
             'task_no':re.findall('\d+', task_text.iloc[0, 0])[0],
             'task_name':task_text.iloc[0, 0].split(":")[1].strip(),
             'mod_no':re.findall('\d+', task_text.iloc[0, 0])[1],
-            'start_date':dt.datetime.strptime(re.findall('\d{2}/\d{2}/\d{2}', task_text.iloc[2, 0])[0],
-                '%m/%d/%y'),
-            'end_date':dt.datetime.strptime(re.findall('\d{2}/\d{2}/\d{2}', task_text.iloc[2, 0])[1],
-                '%m/%d/%y')}
+            'start_date':start_date.strftime("%Y-%m-%d"),
+            'end_date':end_date.strftime("%Y-%m-%d")}
         return task_info
 
     def parse_sub_info(self):
@@ -80,39 +103,45 @@ class Budget:
 
         self.pricer = pd.ExcelFile(os.getcwd() + "/" + self.budget_file)
 
-        self.task_info = self.parse_task_info()
+        task_info = self.parse_task_info()
 
-        self.sub_info = self.parse_sub_info()
+        sub_info = self.parse_sub_info()
 
-        self.labor_info = self.parse_labor()
+        labor_info = self.parse_labor()
 
-        self.travel_info = self.parse_travel()
+        travel_info = self.parse_travel()
 
-        self.expenses_info = self.parse_expenses()
+        expenses_info = self.parse_expenses()
 
 class Rates:
     def __init__(self, rate_file):
         self.rate_file=rate_file
         self.rates=None
-        self.rate_info=None
-        self.staff_levels=None
-        self.level_rates=None
-
-        self.conn = psycopg2.connect(user='airsci', host='localhost', port='5432', database='cost_control')
-        self.cursor = self.conn.cursor()
+        self.conn = psycopg2.connect(user='airsci', host='localhost', port='5432',
+                database='cost_control')
+        self.company_info = pd.read_sql_query("SELECT * FROM info.companies;", self.conn)
 
     def parse_rate_info(self):
         rate_text = self.rates.parse(sheet_name="Rates", header=None, skiprows=2, usecols="B", nrows=2)
-        rate_info = {'company':rate_text.iloc[0, 0].split(":")[1].strip(),
-            'effect_date':dt.datetime.strptime(re.findall('\d{2}/\d{2}/\d{2}', rate_text.iloc[1, 0])[0], '%m/%d/%y')}
-        comp_abrv = "".join([word[0] for word in rate_info['company'].split()])
-        rate_info['sheet_code'] = comp_abrv + "-" + rate_info['effect_date'].strftime("%y%m%d")
-        return rate_info
+        effect_date = dt.datetime.strptime(re.findall('\d{2}/\d{2}/\d{2}',
+            rate_text.iloc[1, 0])[0], '%m/%d/%y')
+        rate_info = {'company':rate_text.iloc[0, 0].split(":")[1].strip()}
+        if rate_info['company'] not in self.company_info['name'].tolist():
+            return("ERROR: Company name on rate sheet not found in company master list")
+        else:
+            comp_abrv = self.company_info.loc[self.company_info['name']==rate_info['company'],'abrv'].item()
+            rate_info['effect_date'] = effect_date.strftime("%Y-%m-%d")
+            rate_info['stored_file_name'] = comp_abrv + "-" + effect_date.strftime("%y%m%d") + ".xlsx"
+            return rate_info
 
     def parse_staff_levels(self):
+        level_info = pd.read_sql_query("SELECT level_id, level FROM info.levels;", self.conn)
+        level_info.set_index('level', inplace=True)
         staff_levels = self.rates.parse(sheet_name="Rates", header=None, skiprows=7, usecols="A,B")
         staff_levels.dropna(how='any', inplace=True)
         staff_levels.columns = ['name', 'level']
+        staff_levels = staff_levels.join(level_info, on='level')
+        staff_levels = staff_levels[['name', 'level_id']]
         return(staff_levels)
 
     def parse_level_rates(self):
@@ -121,30 +150,32 @@ class Rates:
         level_rates.columns = ['level', 'rate']
         return(level_rates)
 
-    def pull_rates(self):
-
+    def process_rates(self):
         self.rates = pd.ExcelFile(os.getcwd() + "/" + self.rate_file)
 
-        self.rate_info = self.parse_rate_info()
-        self.staff_levels = self.parse_staff_levels()
-        self.level_rates = self.parse_level_rates()
+        rate_info = self.parse_rate_info()
+        company_id = self.company_info.loc[self.company_info['name']==\
+                rate_info['company'],'company_id'].item()
+        file_id = stash_file(self.conn, file_type_id=1, file=self.rate_file,
+                storage_name=rate_info['stored_file_name'])
 
+        level_rates = self.parse_level_rates()
+        level_rates['company_id'] = company_id
+        level_rates['effect_date'] = rate_info['effect_date']
+        level_rates['file_id'] = int(file_id)
+        for i in level_rates.iterrows():
+            values = i[1][0:5].tolist()
+            idx = insert_row(self.conn, 'info.levels', values,
+                    columns=['level', 'rate', 'company_id', 'effective_date', 'file_id'],
+                    id_col='level_id')
 
-df1 = pd.read_csv("~/Desktop/dump/comps.csv", header=None)
-
-def insert_row(table, values, columns=None):
-    if columns==None:
-        sql = "INSERT INTO %s VALUES(%s);" % (table, str(values.tolist())[1:-1])
-    else:
-        sql = "INSERT INTO %s(%s) VALUES(%s);" % (table, str(columns)[1:-1].replace("\'", ""), str(values)[1:-1])
-
-    try:
-        self.cursor.execute(sql)
-    except IntegrityError as error:
-        print(error)
-    
-    self.conn.commit()
-
-
-
+        staff_levels = self.parse_staff_levels()
+        staff_levels['company_id'] = company_id
+        staff_levels['effect_date'] = rate_info['effect_date']
+        staff_levels['file_id'] = int(file_id)
+        for i in staff_levels.iterrows():
+            values = i[1][0:5].tolist()
+            idx = insert_row(self.conn, 'info.staff', values,
+                    columns=['name', 'level_id', 'company_id', 'effective_date', 'file_id'],
+                    id_col='level_id')
 

@@ -51,6 +51,7 @@ class Modification:
         self.mod=None
         self.conn = psycopg2.connect(user='airsci', host='localhost', port='5432',
                 database='cost_control')
+        self.company_info = pd.read_sql_query("SELECT * FROM info.companies;", self.conn)
 
     def parse_mod_info(self):
         mod_text = self.mod.parse(sheet_name="Task Order Setup", header=None, usecols="C",
@@ -60,13 +61,13 @@ class Modification:
         end_date = dt.datetime.strptime(re.findall('\d{2}/\d{2}/\d{2}', mod_text.iloc[2, 0])[1],
                 '%m/%d/%y')
         mod_info = {'task_no':re.findall('\d+', mod_text.iloc[0, 0])[0],
-            'mod_no':re.findall('\d+', mod_text.iloc[0, 0])[1],
+            'event_no':re.findall('\d+', mod_text.iloc[0, 0])[1],
             'proj_no':re.findall('\d{3}$', mod_text.iloc[1, 0])[0],
             'name':mod_text.iloc[0, 0].split(":")[1].strip(),
             'start_date':start_date.strftime("%Y-%m-%d"),
             'end_date':end_date.strftime("%Y-%m-%d"),
             'active':True}
-        mod_info['stored_file_name'] = "MOD" + mod_info['mod_no'] + "_" + mod_info['proj_no']\
+        mod_info['stored_file_name'] = "MOD" + mod_info['event_no'] + "_" + mod_info['proj_no']\
                 + "-" + mod_info['task_no']
         return mod_info
 
@@ -79,11 +80,13 @@ class Modification:
         return(sub_info)
 
     def parse_labor(self):
-        labor = self.mod.parse(sheet_name="Labor Hours and Deliverables", header=None, skiprows=7,
+        labor = self.mod.parse(sheet_name="Labor Hours and Deliverables", header=None, skiprows=6,
                 usecols="A,B,C,D,E,F,G,H,I,J,K,L,M,N,O,P,Q,R,S,T,U,V,W,X,Y,Z")
 
-        personnel_end_index = labor.iloc[0, :].tolist().index('-')
-        personnel_list = labor.iloc[0, 5:personnel_end_index].tolist()
+        personnel_end_index = labor.iloc[1, :].tolist().index('-')
+        personnel_list = labor.iloc[1, 5:personnel_end_index].tolist()
+        company_list = labor.iloc[0, 5:personnel_end_index].tolist()
+        rate_list = labor.iloc[2, 5:personnel_end_index].tolist()
 
         labor = labor.iloc[0:labor.iloc[:, 2].tolist().index('.')-3, 0:personnel_end_index]
         labor = labor.loc[[not x==0 for x in labor.loc[:, 4]], :]
@@ -93,11 +96,21 @@ class Modification:
         labor_info = pd.DataFrame({'sub_no':labor.iloc[:, 0], 'work_no':labor.iloc[:, 1],
             'work_name':labor.iloc[:, 2], 'deliv_name':labor.iloc[:, 3],
             'staff_hours':['NULL' for x in labor.iloc[:, 0]],
+            'staff_cost':['NULL' for x in labor.iloc[:, 0]],
+            'company_cost':['NULL' for x in labor.iloc[:, 0]],
             'active':[True for x in labor.iloc[:, 0]]})
         labor_info = labor_info.reset_index().drop('index', axis=1)
         for j in range(0, labor.shape[0]):
             hours = labor.iloc[j, 5:personnel_end_index]
             labor_info.at[j, 'staff_hours'] = {x:y for x,y in zip(personnel_list, hours) if not np.isnan(y)}
+
+            cost = [x*y for x, y in zip(hours, rate_list)]
+            labor_info.at[j, 'staff_cost'] = {x:y for x,y in zip(personnel_list, cost) if not np.isnan(y)}
+
+            tmp = pd.DataFrame({'company':company_list, 'cost':cost}).dropna(how='any')
+            tmp1 = tmp.groupby(['company']).sum().reset_index()
+            labor_info.at[j, 'company_cost'] = {x:y for x,y in zip(tmp1['company'], tmp1['cost']) if not np.isnan(y)}
+
         return(labor_info)
 
     def parse_travel(self):
@@ -122,10 +135,11 @@ class Modification:
         file_id = stash_file(self.conn, file_type_id=2, file=self.mod_file,
                 storage_name=mod_info['stored_file_name'])
         mod_values = [mod_info[x] for x in ['proj_no', 'task_no', 'start_date', 'end_date',
-            'mod_no']] + [39]
+            'event_no']] + [file_id, 'mod']
         mod_idx = insert_row(self.conn, 'project.modifications', mod_values,
-                columns=['proj_no', 'task_no', 'start_date', 'end_date', 'mod_no', 'file_id'],
-                id_col='mod_id')
+                columns=['proj_no', 'task_no', 'start_date', 'end_date', 'event_no', 'file_id',
+                    'event_type'],
+                id_col='event_id')
 
         task_info = [mod_info[x] for x in ['task_no', 'proj_no', 'name', 'active']]
         task_idx = insert_row(self.conn, 'project.tasks', task_info,
@@ -149,15 +163,25 @@ class Modification:
             work_values = [row[1][x] for x in ['work_no', 'work_name', 'active']] + [sub_idx]
             work_idx = insert_row(self.conn, 'project.work', work_values,
                     columns=['work_no', 'name', 'active', 'sub_id'], id_col='work_id')
+
+            hours_df = pd.DataFrame({'name':[x for x in row[1]['company_cost'].keys()],
+                'cost':[x for x in row[1]['company_cost'].values()]})
+            hours_df['work_id'] = work_idx
+            hours_df.set_index('name', inplace=True)
+            hours_df = hours_df.join(self.company_info.set_index('name'))
+            for line in hours_df.iterrows():
+                values = [line[1][x] for x in ['work_id', 'company_id', 'cost']] + [mod_idx]
+                labor_idx = insert_row(self.conn, 'budget.labor', values,
+                        columns=['work_id', 'company_id', 'cost', 'event_id'], id_col='labor_id')
             if not pd.isnull(row[1]['deliv_name']):
                 deliv_values = [row[1][x] for x in ['deliv_name', 'active']] +\
                         [work_idx, False, 'work']
                 deliv_idx = insert_row(self.conn, 'project.deliverables', deliv_values,
                         columns=['name', 'active', 'id', 'complete', 'type'], id_col='deliv_id')
 
-                hours_dict = [row[1][x] for x in ['staff_hours']]
-
         travel_info = self.parse_travel()
+        travel_info.set_index('company', inplace=True)
+        travel_info = travel_info.join(self.company_info.set_index('name'))
         for row in travel_info.iterrows():
             sql = "SELECT sub_id FROM project.subtasks WHERE sub_no = '%s' and task_id = %s"\
                     % (row[1]['sub_no'], task_idx)
@@ -168,8 +192,13 @@ class Modification:
             deliv_values = [row[1][x] for x in ['name']] + [travel_idx, False, 'travel', True]
             deliv_idx = insert_row(self.conn, 'project.deliverables', deliv_values,
                     columns=['name', 'id', 'complete', 'type', 'active'], id_col='deliv_id')
+            trip_values = [row[1][x] for x in ['company_id', 'cost']] + [mod_idx, travel_idx]
+            trip_idx = insert_row(self.conn, 'budget.trips', trip_values,
+                    columns=['company_id', 'cost', 'event_id', 'travel_id'], id_col='trip_id')
 
         expenses_info = self.parse_expenses()
+        expenses_info.set_index('company', inplace=True)
+        expenses_info = expenses_info.join(self.company_info.set_index('name'))
         for row in expenses_info.iterrows():
             sql = "SELECT sub_id FROM project.subtasks WHERE sub_no = '%s' and task_id = %s"\
                     % (row[1]['sub_no'], task_idx)
@@ -180,6 +209,9 @@ class Modification:
             deliv_values = [row[1][x] for x in ['name']] + [expense_idx, False, 'expense', True]
             deliv_idx = insert_row(self.conn, 'project.deliverables', deliv_values,
                     columns=['name', 'id', 'complete', 'type', 'active'], id_col='deliv_id')
+            purchase_values = [row[1][x] for x in ['company_id', 'cost']] + [mod_idx, expense_idx]
+            purchase_idx = insert_row(self.conn, 'budget.purchases', purchase_values,
+                    columns=['company_id', 'cost', 'event_id', 'expense_id'], id_col='purchase_id')
 
 class Rates:
     def __init__(self, rate_file):

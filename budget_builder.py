@@ -136,10 +136,12 @@ class Modification:
                 storage_name=mod_info['stored_file_name'])
         mod_values = [mod_info[x] for x in ['proj_no', 'task_no', 'start_date', 'end_date',
             'event_no']] + [file_id, 'mod']
-        mod_idx = insert_row(self.conn, 'project.modifications', mod_values,
+        mod_idx = insert_row(self.conn, 'budget.events', mod_values,
                 columns=['proj_no', 'task_no', 'start_date', 'end_date', 'event_no', 'file_id',
                     'event_type'],
                 id_col='event_id')
+        if not isinstance(mod_idx, int):
+            mod_idx = "ERROR: This modification has already been uploaded into the system."
 
         task_info = [mod_info[x] for x in ['task_no', 'proj_no', 'name', 'active']]
         task_idx = insert_row(self.conn, 'project.tasks', task_info,
@@ -213,10 +215,11 @@ class Modification:
             purchase_idx = insert_row(self.conn, 'budget.purchases', purchase_values,
                     columns=['company_id', 'cost', 'event_id', 'expense_id'], id_col='purchase_id')
 
+        return(mod_idx)
+
 class Rates:
     def __init__(self, rate_file):
         self.rate_file=rate_file
-        self.rates=None
         self.conn = psycopg2.connect(user='airsci', host='localhost', port='5432',
                 database='cost_control')
         self.company_info = pd.read_sql_query("SELECT * FROM info.companies;", self.conn)
@@ -246,13 +249,13 @@ class Rates:
         level_rates.columns = ['level', 'rate']
         return(level_rates)
 
-    def process_rates(self):
-        self.rates = pd.ExcelFile(os.getcwd() + "/" + self.rate_file)
+    def process_rates(self, rate_file):
+        self.rates = pd.ExcelFile(os.getcwd() + "/" + rate_file)
 
         rate_info = self.parse_rate_info()
         company_id = self.company_info.loc[self.company_info['name']==\
                 rate_info['company'],'company_id'].item()
-        file_id = stash_file(self.conn, file_type_id=1, file=self.rate_file,
+        file_id = stash_file(self.conn, file_type_id=1, file=rate_file,
                 storage_name=rate_info['stored_file_name'])
 
         staff_rates = self.parse_staff_rates()
@@ -264,6 +267,7 @@ class Rates:
             idx = insert_row(self.conn, 'info.staff', values,
                     columns=['name', 'level', 'rate', 'company_id', 'effective_date', 'file_id'],
                     id_col='staff_id')
+        return(rate_info)
 
     def get_current_rate_sheet(self):
         sql = """WITH latest_date AS
@@ -281,6 +285,24 @@ class Rates:
         storage_path = "/Users/john/code/cost_control/storage/current_rate_sheet.csv"
         rate_sheet.to_csv(storage_path, index=False)
         return(storage_path)
+
+    def get_current_company_list(self):
+        sql = """SELECT c.name, cc.abrv
+                 FROM info.companies c
+                 JOIN info.company_classes cc ON cc.class_id=c.class_id;"""
+        company_list = pd.read_sql_query(sql, self.conn)
+        company_list.columns = ['Company', 'Class']
+        storage_path = "/Users/john/code/cost_control/storage/current_company_list.csv"
+        company_list.to_csv(storage_path, index=False)
+        return(storage_path)
+
+class Budget:
+    def __init__(self):
+        self.conn = psycopg2.connect(user='airsci', host='localhost', port='5432',
+                database='cost_control')
+
+
+
 
 
 
